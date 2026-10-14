@@ -254,6 +254,13 @@ def load_new_architecture_dataset(
                 if cb:
                     cur.execute(cb)
 
+        # Asegurar catálogo de cursos e índice de obligatoriedad si están vacíos
+        cur.execute("SELECT COUNT(*) FROM dbo.BGD_MTZ3100_CATCURSO")
+        if cur.fetchone()[0] == 0:
+            logger.info(f"[{database}] Catálogo de cursos vacío. Restaurando automáticamente catálogos normativos...")
+            from seed_catalogos_v2 import seed_catalogos
+            seed_catalogos(database=database)
+
         # 2. Upsert Servicios en dbo.BGD_MTZ3100_SERVICIOS (primero para satisfacer FK)
         if not df_serv.empty:
             logger.info(f"[{database}] Sincronizando {len(df_serv)} servicios en dbo.BGD_MTZ3100_SERVICIOS...")
