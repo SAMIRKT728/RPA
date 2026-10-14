@@ -374,6 +374,7 @@ def load_new_architecture_dataset(
                         r.CEDULA,
                         c.NOMBRE_COLABORADOR,
                         c.COD_SERVICIO,
+                        serv.NOMBRE_SERVICIO,
                         c.CARGO,
                         r.CURSO_ID,
                         cat.CURSO_NOMBRE AS CAT_CURSO_NOMBRE,
@@ -392,6 +393,8 @@ def load_new_architecture_dataset(
                     INNER JOIN dbo.BGD_MTZ_COL c
                         ON c.CEDULA COLLATE DATABASE_DEFAULT = r.CEDULA COLLATE DATABASE_DEFAULT
                        AND c.SEDE COLLATE DATABASE_DEFAULT = r.SEDE COLLATE DATABASE_DEFAULT
+                    LEFT JOIN dbo.BGD_MTZ3100_SERVICIOS serv
+                        ON serv.COD_SERVICIO COLLATE DATABASE_DEFAULT = c.COD_SERVICIO COLLATE DATABASE_DEFAULT
                     INNER JOIN dbo.BGD_MTZ3100_CATCURSO cat
                         ON cat.ID_CURSO COLLATE DATABASE_DEFAULT = r.CURSO_ID COLLATE DATABASE_DEFAULT
                     CROSS APPLY (
@@ -512,6 +515,8 @@ def load_new_architecture_dataset(
                         MES_ANALISIS,
                         CEDULA,
                         NOMBRE_COLABORADOR,
+                        COD_SERVICIO,
+                        NOMBRE_SERVICIO,
                         SEDE,
                         CURSO_ID,
                         CAT_CURSO_NOMBRE AS CURSO_NOMBRE,
@@ -578,6 +583,8 @@ def load_new_architecture_dataset(
                 WHEN MATCHED THEN
                     UPDATE SET 
                         t.NOMBRE_COLABORADOR = s.NOMBRE_COLABORADOR,
+                        t.COD_SERVICIO = s.COD_SERVICIO,
+                        t.NOMBRE_SERVICIO = s.NOMBRE_SERVICIO,
                         t.CURSO_NOMBRE = s.CURSO_NOMBRE,
                         t.MARCA_ORIGEN = s.MARCA_ORIGEN,
                         t.FECHA_REAL_ORIGEN = s.FECHA_REAL_ORIGEN,
@@ -597,13 +604,13 @@ def load_new_architecture_dataset(
                         t.FECHA_CALCULO = s.FECHA_CALCULO
                 WHEN NOT MATCHED THEN
                     INSERT (
-                        MES_ANALISIS, CEDULA, NOMBRE_COLABORADOR, SEDE, MULTISEDE,
+                        MES_ANALISIS, CEDULA, NOMBRE_COLABORADOR, COD_SERVICIO, NOMBRE_SERVICIO, SEDE, MULTISEDE,
                         CURSO_ID, CURSO_NOMBRE, MARCA_ORIGEN, FECHA_REAL_ORIGEN, FECHA_VENC_ORIGEN,
                         LECTURA, OBLIGATORIO, VIGENCIA_MESES, VENC_EFECTIVO, REAL_EFECTIVA,
                         ESTADO_DETALLADO, MARCA, DIAS_PARA_VENCER, CUENTA_INDICADOR,
                         ALERTA, OBSERVACION, SUBSANADO_CONTROL_CALIDAD, FECHA_CALCULO
                     ) VALUES (
-                        s.MES_ANALISIS, s.CEDULA, s.NOMBRE_COLABORADOR, s.SEDE, 'NO',
+                        s.MES_ANALISIS, s.CEDULA, s.NOMBRE_COLABORADOR, s.COD_SERVICIO, s.NOMBRE_SERVICIO, s.SEDE, 'NO',
                         s.CURSO_ID, s.CURSO_NOMBRE, s.MARCA_ORIGEN, s.FECHA_REAL_ORIGEN, s.FECHA_VENC_ORIGEN,
                         s.LECTURA, s.OBLIGATORIO, s.VIGENCIA_MESES, s.VENC_EFECTIVO, s.REAL_EFECTIVA,
                         s.ESTADO_DETALLADO, s.MARCA, s.DIAS_PARA_VENCER, s.CUENTA_INDICADOR,
