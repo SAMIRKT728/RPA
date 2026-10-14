@@ -28,36 +28,31 @@ BEGIN
     PRINT 'Iniciando dbo.sp_ObtenerJefesUnificados_v2';
     PRINT '=======================================================';
 
-    -- 1. Garantizar existencia física de la tabla de catálogo BGD_JEFES_UNIFICADOS_MX100
-    IF OBJECT_ID('dbo.BGD_JEFES_UNIFICADOS_MX100', 'U') IS NULL
-    BEGIN
-        CREATE TABLE dbo.BGD_JEFES_UNIFICADOS_MX100 (
-            NombreUnificado NVARCHAR(250) NOT NULL PRIMARY KEY,
-            Variantes NVARCHAR(MAX) NOT NULL,
-            CantidadVariantes INT NOT NULL,
-            _fecha_calculo DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
-        );
-
-        CREATE NONCLUSTERED INDEX IX_BGD_JEFES_UNIFICADOS_CANTIDAD
-        ON dbo.BGD_JEFES_UNIFICADOS_MX100 (CantidadVariantes DESC);
-    END;
-
-    -- 2. Garantizar existencia física de la tabla BDG_MTZ_JEFE
+    -- 1. Garantizar existencia física de la tabla BDG_MTZ_JEFE y sus columnas
     IF OBJECT_ID('dbo.BDG_MTZ_JEFE', 'U') IS NULL
     BEGIN
         CREATE TABLE dbo.BDG_MTZ_JEFE (
             CEDULA NVARCHAR(12) NULL,
             [NOMBRE DEL JEFE] NVARCHAR(200) NOT NULL,
             SEDE VARCHAR(50) NOT NULL,
+            VARIANTES NVARCHAR(MAX) NULL,
+            REPETIDOS INT NOT NULL DEFAULT 1,
             [FECHA CARGA] DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
         );
 
         CREATE NONCLUSTERED INDEX IX_BDG_MTZ_JEFE_SEDE 
         ON dbo.BDG_MTZ_JEFE (SEDE, [NOMBRE DEL JEFE]);
+    END
+    ELSE
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.BDG_MTZ_JEFE') AND name = 'VARIANTES')
+            ALTER TABLE dbo.BDG_MTZ_JEFE ADD VARIANTES NVARCHAR(MAX) NULL;
+
+        IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.BDG_MTZ_JEFE') AND name = 'REPETIDOS')
+            ALTER TABLE dbo.BDG_MTZ_JEFE ADD REPETIDOS INT NOT NULL DEFAULT 1;
     END;
 
-    -- 3. Limpieza previa de tablas de destino
-    TRUNCATE TABLE dbo.BGD_JEFES_UNIFICADOS_MX100;
+    -- 2. Limpieza previa de BDG_MTZ_JEFE
     TRUNCATE TABLE dbo.BDG_MTZ_JEFE;
 
     -- 4. Extracción de Nombres Originales de Jefes por Sede desde BGD_MTZ_COL
@@ -203,36 +198,26 @@ BEGIN
     FROM Resultado
     WHERE RN = 1;
 
-    -- 5. Persistir en la tabla de catálogo BGD_JEFES_UNIFICADOS_MX100
-    INSERT INTO dbo.BGD_JEFES_UNIFICADOS_MX100 (
-        NombreUnificado,
-        Variantes,
-        CantidadVariantes,
-        _fecha_calculo
-    )
-    SELECT
-        NombreUnificado,
-        STRING_AGG(CAST(NombreOriginal AS VARCHAR(MAX)), ' | ') AS Variantes,
-        COUNT(NombreOriginal) AS CantidadVariantes,
-        SYSUTCDATETIME()
-    FROM #ResultadoUnificacion
-    GROUP BY NombreUnificado;
-
-    -- 6. Poblar la nueva tabla dbo.BDG_MTZ_JEFE
-    -- Rellenando los demás campos excepto la CÉDULA (que permanece en NULL)
+    -- 5. Poblar la tabla dbo.BDG_MTZ_JEFE
+    -- Rellenando los campos incluyendo VARIANTES y REPETIDOS, dejando CÉDULA en NULL
     INSERT INTO dbo.BDG_MTZ_JEFE (
         CEDULA,
         [NOMBRE DEL JEFE],
         SEDE,
+        VARIANTES,
+        REPETIDOS,
         [FECHA CARGA]
     )
-    SELECT DISTINCT
+    SELECT 
         CAST(NULL AS NVARCHAR(12)) AS CEDULA,
         r.NombreUnificado AS [NOMBRE DEL JEFE],
         s.Sede AS SEDE,
+        STRING_AGG(CAST(s.NombreOriginal AS NVARCHAR(MAX)), ' | ') WITHIN GROUP (ORDER BY s.NombreOriginal) AS VARIANTES,
+        COUNT(DISTINCT s.NombreOriginal) AS REPETIDOS,
         SYSUTCDATETIME() AS [FECHA CARGA]
     FROM #SedeJefes s
     JOIN #ResultadoUnificacion r ON s.NombreOriginal = r.NombreOriginal
+    GROUP BY s.Sede, r.NombreUnificado
     ORDER BY s.Sede, r.NombreUnificado;
 
     DECLARE @TotalJefes INT = @@ROWCOUNT;

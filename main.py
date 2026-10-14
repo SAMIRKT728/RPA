@@ -163,7 +163,7 @@ def execute_dashboard_stored_procedures(fecha_corte_str: str = None, mes_analisi
         if cur.fetchone()[0]:
             logger.info("Llamando a dbo.sp_ObtenerJefesUnificados_v2...")
             cur.execute("EXEC dbo.sp_ObtenerJefesUnificados_v2")
-            logger.info("dbo.sp_ObtenerJefesUnificados_v2 finalizado (BDG_MTZ_JEFE y BGD_JEFES_UNIFICADOS_MX100 actualizados).")
+            logger.info("dbo.sp_ObtenerJefesUnificados_v2 finalizado (BDG_MTZ_JEFE actualizado con Variantes y Repetidos).")
 
         # 2. Poblar Dashboard v2 (BGD_MTZ3100_DASH)
         cur.execute("SELECT OBJECT_ID('dbo.SP_POBLAR_BGD_MTZ3100_DASH_V2', 'P')")
