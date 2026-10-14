@@ -140,56 +140,67 @@ def get_default_previous_month_dates():
 
 def execute_dashboard_stored_procedures(fecha_corte_str: str = None, mes_analisis_str: str = None, ventana_dias: int = 90):
     """
-    Ejecuta directamente los procedimientos almacenados en SQL Server para poblar
-    BGD_DASHBOARD_CURSOS_3100 y BGD_RESUMEN_MES_3100 de forma nativa, veloz y optimizada.
+    Ejecuta directamente los procedimientos almacenados v2 en SQL Server para poblar
+    BDG_MTZ_JEFE, BGD_MTZ3100_DASH y BGD_MTZ3100_RESUMEN de forma nativa, veloz y optimizada.
     """
+    target_db = config.SQL_DATABASE or "DGEMPRES01"
     if not fecha_corte_str or not mes_analisis_str:
         def_corte, def_mes = get_default_previous_month_dates()
         fecha_corte_str = fecha_corte_str or def_corte
         mes_analisis_str = mes_analisis_str or def_mes
 
     logger.info("======================================================")
-    logger.info("Ejecutando procedimientos almacenados en el motor SQL Server...")
+    logger.info(f"Ejecutando procedimientos almacenados v2 en [{target_db}]...")
     logger.info(f" -> Fecha de Corte : {fecha_corte_str}")
     logger.info(f" -> Mes de Análisis: {mes_analisis_str}")
     logger.info(f" -> Ventana de Días: {ventana_dias}")
 
-    # Asegurar que las tablas de persistencia existan
-    from data_access.db_repository import DbRepository
-    DbRepository(database="DGEMPRES01").init_tables_and_indexes()
-
-    conn = get_mssql_connection("DGEMPRES01")
+    conn = get_mssql_connection(target_db)
     cur = conn.cursor()
 
     try:
-        # 1. Poblar Dashboard
-        logger.info("Llamando a dbo.SP_POBLAR_BGD_DASHBOARD_CURSOS_3100...")
-        cur.execute(
-            "EXEC dbo.SP_POBLAR_BGD_DASHBOARD_CURSOS_3100 @FechaCorte=%s, @VentanaDias=%d, @MesAnalisis=%s",
-            (fecha_corte_str, ventana_dias, mes_analisis_str)
-        )
-        logger.info("dbo.SP_POBLAR_BGD_DASHBOARD_CURSOS_3100 finalizado exitosamente.")
+        # 1. Actualizar catálogo de jefes unificados y BDG_MTZ_JEFE
+        cur.execute("SELECT OBJECT_ID('dbo.sp_ObtenerJefesUnificados_v2', 'P')")
+        if cur.fetchone()[0]:
+            logger.info("Llamando a dbo.sp_ObtenerJefesUnificados_v2...")
+            cur.execute("EXEC dbo.sp_ObtenerJefesUnificados_v2")
+            logger.info("dbo.sp_ObtenerJefesUnificados_v2 finalizado (BDG_MTZ_JEFE y BGD_JEFES_UNIFICADOS_MX100 actualizados).")
 
-        # 2. Poblar Resumen Mes
-        logger.info("Llamando a dbo.SP_POBLAR_BGD_RESUMEN_MES_3100...")
-        cur.execute(
-            "EXEC dbo.SP_POBLAR_BGD_RESUMEN_MES_3100 @FechaCorte=%s",
-            (fecha_corte_str,)
-        )
-        logger.info("dbo.SP_POBLAR_BGD_RESUMEN_MES_3100 finalizado exitosamente.")
+        # 2. Poblar Dashboard v2 (BGD_MTZ3100_DASH)
+        cur.execute("SELECT OBJECT_ID('dbo.SP_POBLAR_BGD_MTZ3100_DASH_V2', 'P')")
+        if cur.fetchone()[0]:
+            logger.info("Llamando a dbo.SP_POBLAR_BGD_MTZ3100_DASH_V2...")
+            cur.execute(
+                "EXEC dbo.SP_POBLAR_BGD_MTZ3100_DASH_V2 @FechaCorte=%s, @VentanaDias=%d, @MesAnalisis=%s",
+                (fecha_corte_str, ventana_dias, mes_analisis_str)
+            )
+            logger.info("dbo.SP_POBLAR_BGD_MTZ3100_DASH_V2 finalizado exitosamente.")
+
+        # 3. Poblar Resumen Mes v2 (BGD_MTZ3100_RESUMEN)
+        cur.execute("SELECT OBJECT_ID('dbo.SP_POBLAR_BGD_MTZ3100_RESUMEN_V2', 'P')")
+        if cur.fetchone()[0]:
+            logger.info("Llamando a dbo.SP_POBLAR_BGD_MTZ3100_RESUMEN_V2...")
+            cur.execute(
+                "EXEC dbo.SP_POBLAR_BGD_MTZ3100_RESUMEN_V2 @FechaCorte=%s",
+                (fecha_corte_str,)
+            )
+            logger.info("dbo.SP_POBLAR_BGD_MTZ3100_RESUMEN_V2 finalizado exitosamente.")
+
         logger.info("======================================================")
     finally:
         conn.close()
 
 
-def process_excel_buffer_with_spark(spark, buffer, filename: str, database: str, table_name: str, dry_run: bool = False, mes_analisis: Optional[str] = None):
+def process_excel_buffer_with_spark(spark, buffer, filename: str, database: str, table_name: str, dry_run: bool = False, mes_analisis: Optional[str] = None, sede: str = "GENERAL"):
     """
-    Lee un buffer Excel (.xlsx), aplica la estandarización y limpieza integral de datos
-    (Cédulas sin decimales, Cursos SI/NO/vacío, Fechas en DATETIME2, Textos acotados),
-    lo transfiere a PySpark y ejecuta la carga idempotente a SQL Server.
+    Lee un buffer Excel (.xlsx), aplica la estandarización y limpieza integral de datos,
+    carga en la nueva arquitectura normalizada (BGD_MTZ_COL, BGD_MTZ3100_SERVICIOS, BGD_MTZ_CURSOS_RAW)
+    y sincroniza la tabla con PySpark.
     """
     logger.info(f"Leyendo contenido de '{filename}' (sin validación de colores)...")
-    from data_standardizer import read_excel_with_styles, clean_and_standardize_dataframe
+    from data_standardizer import read_excel_with_styles, clean_and_standardize_dataframe, unpivot_courses_to_raw_dataset
+    from db_loader import load_new_architecture_dataset
+    
     df_raw = read_excel_with_styles(buffer, filename)
     df_pandas = clean_and_standardize_dataframe(df_raw, filename, mes_analisis=mes_analisis)
 
@@ -204,13 +215,28 @@ def process_excel_buffer_with_spark(spark, buffer, filename: str, database: str,
         logger.info(f"[DRY-RUN] Destino previsto: Base de datos='{database}', Tabla='{table_name}'. No se escribirán datos.")
         return row_count
 
-    # Convertir a Spark DataFrame asegurando tipos StringType consistentes (evita void/NullType)
-    logger.info("Transformando a DataFrame de PySpark...")
-    df_spark_prep = df_pandas.fillna("").astype(str).replace({"nan": "", "None": "", "<NA>": ""})
-    spark_df = spark.createDataFrame(df_spark_prep)
+    target_mes = mes_analisis or (df_pandas["_mes_analisis"].iloc[0] if "_mes_analisis" in df_pandas.columns else datetime.now().strftime("%Y-%m"))
 
-    # Ejecutar carga idempotente y sincronización de esquema
-    inserted = load_dataframe_idempotent(spark, spark_df, database, table_name, filename)
+    # 1. Cargar en la nueva arquitectura normalizada (BGD_MTZ_COL, BGD_MTZ3100_SERVICIOS, BGD_MTZ_CURSOS_RAW)
+    norm_inserted = 0
+    try:
+        df_colab, df_serv, df_raw_courses = unpivot_courses_to_raw_dataset(df_pandas, sede=sede, mes_analisis=target_mes, filename=filename)
+        load_new_architecture_dataset(df_colab, df_serv, df_raw_courses, database=database)
+        norm_inserted = len(df_raw_courses)
+    except Exception as ex_norm:
+        logger.error(f"Error al cargar en nueva arquitectura: {ex_norm}")
+        raise
+
+    # 2. Cargar en tabla de sede con PySpark (retrocompatibilidad si la tabla existe o se requiere)
+    inserted = norm_inserted
+    try:
+        logger.info("Transformando a DataFrame de PySpark para tabla legada...")
+        df_spark_prep = df_pandas.fillna("").astype(str).replace({"nan": "", "None": "", "<NA>": ""})
+        spark_df = spark.createDataFrame(df_spark_prep)
+        inserted = load_dataframe_idempotent(spark, spark_df, database, table_name, filename)
+    except Exception as ex_spark:
+        logger.warning(f"Omitiendo carga en tabla legada '{table_name}': {ex_spark}")
+
     return inserted
 
 
@@ -240,7 +266,7 @@ def run_rpa(folder_id: str = None, pattern: str = "MATRIZ 3100", local_file: str
             with open(local_file, "rb") as f:
                 import io
                 buf = io.BytesIO(f.read())
-                process_excel_buffer_with_spark(spark, buf, filename, database, table_name, dry_run, mes_analisis=mes_analisis)
+                process_excel_buffer_with_spark(spark, buf, filename, database, table_name, dry_run, mes_analisis=mes_analisis, sede=sede)
             return
 
         # Caso B: Procesar desde Google Drive (con soporte de subcarpetas por mes)
@@ -294,8 +320,8 @@ def run_rpa(folder_id: str = None, pattern: str = "MATRIZ 3100", local_file: str
                 # Descargar archivo a memoria
                 buffer = download_file_to_bytes(file_id, mime_type)
 
-                # Procesar con PySpark y subir a SQL Server
-                inserted = process_excel_buffer_with_spark(spark, buffer, filename, database, table_name, dry_run, mes_analisis=target_mes)
+                # Procesar y subir a la nueva arquitectura y a SQL Server
+                inserted = process_excel_buffer_with_spark(spark, buffer, filename, database, table_name, dry_run, mes_analisis=target_mes, sede=sede)
                 total_inserted += inserted
                 processed_count += 1
 
@@ -306,24 +332,8 @@ def run_rpa(folder_id: str = None, pattern: str = "MATRIZ 3100", local_file: str
             logger.info(f"RESUMEN LOTE '{batch_name}': {processed_count} archivos procesados. Total nuevos registros insertados: {total_inserted}")
             logger.info("======================================================")
 
-            # Actualizar tabla de Jefes Unificados mediante el procedimiento almacenado si existe
+            # Ejecutar Stored Procedures v2 de cálculo normativo (Jefes, Dashboard y Resumen Mes)
             if not dry_run and processed_count > 0:
-                try:
-                    conn_jefes = get_mssql_connection("DGEMPRES01")
-                    cur_jefes = conn_jefes.cursor()
-                    cur_jefes.execute("SELECT OBJECT_ID('dbo.sp_ObtenerJefesUnificados_MX100', 'P')")
-                    sp_row = cur_jefes.fetchone()
-                    if sp_row and sp_row[0]:
-                        logger.info("Actualizando catálogo de jefes unificados (sp_ObtenerJefesUnificados_MX100)...")
-                        cur_jefes.execute("EXEC dbo.sp_ObtenerJefesUnificados_MX100")
-                        logger.info("Catálogo de jefes unificados actualizado exitosamente en DGEMPRES01.dbo.BGD_JEFES_UNIFICADOS_MX100.")
-                    else:
-                        logger.info("Procedimiento dbo.sp_ObtenerJefesUnificados_MX100 no está disponible aún. Omitiendo actualización de jefes.")
-                    conn_jefes.close()
-                except Exception as ex_sp:
-                    logger.warning(f"Aviso al actualizar catálogo de jefes unificados: {str(ex_sp)}")
-
-                # Ejecutar Stored Procedures de cálculo normativo (Dashboard y Resumen Mes)
                 try:
                     execute_dashboard_stored_procedures(
                         fecha_corte_str=target_corte,

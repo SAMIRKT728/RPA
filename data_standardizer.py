@@ -149,24 +149,30 @@ def get_standard_sql_type(col_name: str) -> str:
 def select_best_worksheet(wb) -> Any:
     """
     Selecciona inteligentemente la hoja que contiene la matriz 3100 principal.
-    Prioriza hojas con columnas de cursos y personal, descartando hojas de indicadores o portadas.
+    Examina las primeras filas de cada hoja buscando encabezados de cursos y personal.
     """
     best_sheet = None
     max_score = -1
 
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
-        first_row = next(ws.iter_rows(values_only=True), None)
-        if not first_row:
-            continue
-        headers_upper = [str(c).upper() for c in first_row if c is not None]
-        score = sum(1 for h in headers_upper if any(k in h for k in ("BLS", "ACLS", "PALS", "NALS", "CURSO", "DIPLOMADO")))
-        if any("CEDULA" in h or "DOCUMENTO" in h or "EMPLEADO" in h for h in headers_upper):
-            score += 10
-        if sheet_name.strip().upper() in ("3100", "AG", "MATRIZ", "CURSOS 3100", "ASISTENCIALES"):
-            score += 5
+        score = 0
+        if sheet_name.strip().upper() in ("3100", "AG", "MATRIZ", "CURSOS 3100", "ASISTENCIALES", "CURSOS"):
+            score += 15
         if "INDICADOR" in sheet_name.strip().upper() or "PORCENTAJE" in sheet_name.strip().upper():
-            score -= 10
+            score -= 20
+
+        # Escanear hasta 10 filas buscando indicadores de matriz
+        for idx, r in enumerate(ws.iter_rows(values_only=True)):
+            if idx >= 10:
+                break
+            if not r:
+                continue
+            r_str = [str(c).upper().strip() for c in r if c is not None]
+            score += sum(1 for h in r_str if any(k in h for k in ("BLS", "ACLS", "PALS", "NALS", "DIPLOMADO")))
+            if any("CEDULA" in h or "DOCUMENTO" in h or "EMPLEADO" in h for h in r_str):
+                score += 10
+                break
 
         if score > max_score:
             max_score = score
@@ -178,32 +184,43 @@ def select_best_worksheet(wb) -> Any:
 def read_excel_with_styles(buffer_or_path: Any, filename: str = "") -> pd.DataFrame:
     """
     Lee un archivo Excel extrayendo directamente los valores de las celdas de la matriz principal,
-    omitiendo cualquier validación o interpretación de colores y estilos visuales.
+    detectando de forma dinámica la fila de encabezados (incluso si hay títulos o celdas combinadas arriba).
     """
     import openpyxl
     wb = openpyxl.load_workbook(buffer_or_path, data_only=True, read_only=True)
     ws = select_best_worksheet(wb)
     
-    rows_iter = ws.iter_rows(values_only=True)
-    first_row = next(rows_iter, None)
-    if not first_row:
-        wb.close()
-        return pd.DataFrame()
-
-    headers = [str(c).strip() if c is not None else "" for c in first_row]
-    # Recortar columnas vacías al final (evita miles de columnas espurias por formato extendido)
-    while headers and not headers[-1]:
-        headers.pop()
-    num_cols = len(headers)
-
+    header_idx = None
+    headers = []
     data = []
-    for r in rows_iter:
-        if any(c is not None and str(c).strip() != "" for c in r[:num_cols]):
-            data.append(r[:num_cols])
+
+    for idx, r in enumerate(ws.iter_rows(values_only=True)):
+        if header_idx is None:
+            r_str = [str(c).upper().strip() for c in r if c is not None]
+            has_id = any("CEDULA" in c or "DOCUMENTO" in c or "EMPLEADO" in c for c in r_str)
+            has_course = any(k in c for c in r_str for k in ("BLS", "ACLS", "PALS", "NALS", "CARGO"))
+            if has_id or (has_course and len(r_str) >= 5):
+                header_idx = idx
+                headers = [str(c).strip() if c is not None else "" for c in r]
+                while headers and not headers[-1]:
+                    headers.pop()
+                continue
+            if idx >= 15:
+                # Fallback
+                header_idx = 0
+                headers = [str(c).strip() if c is not None else "" for c in r]
+                while headers and not headers[-1]:
+                    headers.pop()
+                continue
+        else:
+            num_cols = len(headers)
+            if any(c is not None and str(c).strip() != "" for c in r[:num_cols]):
+                data.append(r[:num_cols])
+
     wb.close()
 
-    if filename:
-        logger.info(f"Hoja seleccionada para '{filename}': '{ws.title}' ({len(data)} filas, {num_cols} columnas).")
+    if filename and ws is not None:
+        logger.info(f"Hoja seleccionada para '{filename}': '{ws.title}' ({len(data)} filas, {len(headers)} columnas).")
 
     return pd.DataFrame(data, columns=headers)
 
@@ -678,3 +695,158 @@ def synchronize_table_schema(cursor, database: str, table_name: str, incoming_co
                 ON [dbo].[{clean_table}] ([{col}] ASC);
             END
             """)
+
+
+# ==============================================================================
+# 6. CATÁLOGO NORMATIVO Y DESPIVOTEO PARA LA NUEVA ARQUITECTURA
+# ==============================================================================
+
+NORMATIVE_COURSES: List[Tuple[str, str]] = [
+    ("C01", "BLS"),
+    ("C02", "ACLS"),
+    ("C03", "GESTION DEL DUELO"),
+    ("C04", "ATENCION A LAS VICTIMAS DE ATAQUES QUIMICOS"),
+    ("C05", "ATENCION A LAS VICTIMAS DE VIOLENCIA SEXUAL"),
+    ("C06", "HUMANIZACION"),
+    ("C07", "GESTION OPERATIVA DE LA DONACION"),
+    ("C08", "DENGUE"),
+    ("C09", "POCT"),
+    ("C10", "PALS"),
+    ("C11", "NALS"),
+    ("C12", "AIEPI"),
+    ("C13", "MANEJO DEL DOLOR Y CUIDADOS PALIATIVOS"),
+    ("C14", "INMUNOLOGÍA DE TRANSPLANTES"),
+    ("C15", "GESTIÓN PRE-TRANSFUCIONAL"),
+    ("C16", "ADMINISTRACIÓN DE MEDICAMENTOS"),
+    ("C17", "TOMA DE MUESTRAS"),
+    ("C18", "CADENA DE FRIO"),
+    ("C19", "ATENCIÓN DEL PACIENTE EN DIÁLISIS RENAL - DIALISIS"),
+    ("C20", "ASESORIA PRE TEST POST TEST HIV"),
+    ("C21", "OVEM - COVE"),
+    ("C22", "DIPLOMADO MANEJO DE PACIENTE ONCOLOGICO"),
+    ("C23", "DIPLOMADO CUIDADO INTENSIVO DE PACIENTE NEONATO"),
+    ("C24", "DIPLOMADO CUIDADO INTENSIVO DE PACIENTE ADULTO"),
+    ("C25", "DIPLOMADO CUIDADO INTENSIVO DE PACIENTE PEDIATRICO"),
+    ("C26", "DIPLOMADO ONCO - HEMATOLOGÍA PEDIATRICA"),
+    ("C27", "DIPLOMADO CUIDADO INTENSIVO DE PACIENTE QUEMADO"),
+    ("C28", "DIPLOMADO URGENCIAS")
+]
+
+
+def strip_accents(text: str) -> str:
+    import unicodedata
+    return unicodedata.normalize('NFKD', str(text)).encode('ASCII', 'ignore').decode('utf-8').upper().strip()
+
+
+def unpivot_courses_to_raw_dataset(
+    df: pd.DataFrame, 
+    sede: str, 
+    mes_analisis: str, 
+    filename: str
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Despivotea los 28 cursos y extrae los DataFrames de:
+    1. Colaboradores (para dbo.BGD_MTZ_COL)
+    2. Servicios (para dbo.BGD_MTZ3100_SERVICIOS)
+    3. Cursos Raw (para dbo.BGD_MTZ_CURSOS_RAW)
+    """
+    emp_col = next((c for c in df.columns if "NOMBRE" in c.upper() and "EMPLEADO" in c.upper()), None)
+    ced_col = next((c for c in df.columns if "CEDULA" in c.upper()), "CEDULA")
+    jefe_col = next((c for c in df.columns if "JEFE" in c.upper()), None)
+    cargo_col = next((c for c in df.columns if "CARGO" in c.upper()), None)
+    cod_col = next((c for c in df.columns if c.upper() == "CODIGO"), None)
+    est_col = next((c for c in df.columns if c.upper() == "ESTADO"), None)
+    cod_serv_col = next((c for c in df.columns if "COD_SERVICIO" in c.upper()), None)
+    serv_col = next((c for c in df.columns if c.upper() == "SERVICIO"), None)
+
+    # 1. Colaboradores
+    colab_rows = []
+    for _, r in df.iterrows():
+        ced = str(r[ced_col]).strip() if pd.notna(r[ced_col]) else None
+        if not ced or ced in ("None", "nan", "", "0", "-"):
+            continue
+
+        nom = str(r[emp_col]).strip() if emp_col and pd.notna(r[emp_col]) else "SIN ESPECIFICAR"
+        c_cod = str(r[cod_col]).strip() if cod_col and pd.notna(r[cod_col]) else None
+        c_est = str(r[est_col]).strip() if est_col and pd.notna(r[est_col]) else "ACTIVO"
+        c_cargo = str(r[cargo_col]).strip() if cargo_col and pd.notna(r[cargo_col]) else "SIN CARGO"
+        c_serv_cod = str(r[cod_serv_col]).strip() if cod_serv_col and pd.notna(r[cod_serv_col]) else "0000"
+        c_jefe = str(r[jefe_col]).strip() if jefe_col and pd.notna(r[jefe_col]) else "SIN DATO"
+
+        colab_rows.append({
+            "CEDULA": ced[:12],
+            "SEDE": sede,
+            "NOMBRE_COLABORADOR": nom[:200],
+            "CODIGO": c_cod[:50] if c_cod else None,
+            "ESTADO": c_est[:50] if c_est else "ACTIVO",
+            "CARGO": c_cargo[:150],
+            "COD_SERVICIO": c_serv_cod[:10] if c_serv_cod else "0000",
+            "JEFE INMEDIATO": c_jefe[:200]
+        })
+    df_colab = pd.DataFrame(colab_rows).drop_duplicates(subset=["CEDULA", "SEDE"]) if colab_rows else pd.DataFrame()
+
+    # 2. Servicios
+    serv_rows = []
+    if cod_serv_col and serv_col:
+        temp_serv = df[[cod_serv_col, serv_col]].dropna(subset=[cod_serv_col]).drop_duplicates(subset=[cod_serv_col])
+        for _, r in temp_serv.iterrows():
+            c_s = str(r[cod_serv_col]).strip()
+            n_s = str(r[serv_col]).strip()
+            if c_s and c_s not in ("None", "nan", ""):
+                serv_rows.append({"COD_SERVICIO": c_s[:10], "NOMBRE_SERVICIO": n_s[:150] or "GENERAL"})
+    df_serv = pd.DataFrame(serv_rows).drop_duplicates(subset=["COD_SERVICIO"]) if serv_rows else pd.DataFrame()
+
+    # 3. Cursos Raw (Unpivoteado)
+    norm_cols_map = {strip_accents(c): (idx, c) for idx, c in enumerate(df.columns)}
+    all_unpivoted = []
+
+    for cid, cname in NORMATIVE_COURSES:
+        norm_cname = strip_accents(cname)
+        matched_info = norm_cols_map.get(norm_cname)
+        
+        col_mark = matched_info[1] if matched_info else None
+        col_real = None
+        col_venc = None
+        lectura = "OK"
+
+        if col_mark:
+            c_idx = matched_info[0]
+            # Buscar columnas de fecha adyacentes en las próximas 3 columnas
+            for offset in range(1, 4):
+                if c_idx + offset < len(df.columns):
+                    next_col = df.columns[c_idx + offset]
+                    next_col_norm = strip_accents(next_col)
+                    if "REALIZA" in next_col_norm and not col_real:
+                        col_real = next_col
+                    elif "VENC" in next_col_norm and not col_venc:
+                        col_venc = next_col
+        else:
+            lectura = "SIN_COLUMNA"
+
+        for _, row in df.iterrows():
+            ced = str(row[ced_col]).strip() if pd.notna(row[ced_col]) else None
+            if not ced or ced in ("None", "nan", "", "0", "-"):
+                continue
+
+            marca = clean_course_value(row[col_mark]) if col_mark and pd.notna(row[col_mark]) else None
+            f_real = clean_date_value(row[col_real]) if col_real and pd.notna(row[col_real]) else None
+            f_venc = clean_date_value(row[col_venc]) if col_venc and pd.notna(row[col_venc]) else None
+
+            d_real = f_real.split(" ")[0] if f_real else None
+            d_venc = f_venc.split(" ")[0] if f_venc else None
+
+            all_unpivoted.append({
+                "MES_ANALISIS": mes_analisis,
+                "SEDE": sede,
+                "CEDULA": ced[:12],
+                "CURSO_ID": cid,
+                "CURSO_NOMBRE": cname,
+                "MARCA_ORIGEN": marca,
+                "FECHA_REAL_ORIGEN": d_real,
+                "FECHA_VENC_ORIGEN": d_venc,
+                "LECTURA": lectura,
+                "_archivo_origen": filename
+            })
+
+    df_raw_courses = pd.DataFrame(all_unpivoted).drop_duplicates(subset=["MES_ANALISIS", "SEDE", "CEDULA", "CURSO_ID"]) if all_unpivoted else pd.DataFrame()
+    return df_colab, df_serv, df_raw_courses

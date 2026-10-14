@@ -16,6 +16,7 @@ class Config:
     SQL_PORT: int = int(os.getenv("SQL_PORT", "1433"))
     SQL_USER: str = os.getenv("SQL_USER", "")
     SQL_PASSWORD: str = os.getenv("SQL_PASSWORD", "")
+    SQL_DATABASE: Optional[str] = os.getenv("SQL_DATABASE")
     SQL_ENCRYPT: bool = os.getenv("SQL_ENCRYPT", "false").lower() in ("true", "1", "yes")
     SQL_TRUST_CERT: bool = os.getenv("SQL_TRUST_CERT", "true").lower() in ("true", "1", "yes")
 
@@ -65,7 +66,8 @@ def resolve_db_and_table(filename: str, prefix: str = "BGD_MATRIZ_3100_") -> Opt
         if re.search(pattern, clean_name) or key in clean_name:
             pref = config.TABLE_PREFIX or prefix
             table_name = f"{pref}{sede_suffix}".upper()
-            return db_name, table_name, sede_suffix
+            target_db = config.SQL_DATABASE or db_name
+            return target_db, table_name, sede_suffix
             
     return None
 

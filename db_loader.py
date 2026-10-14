@@ -167,7 +167,14 @@ def load_dataframe_idempotent(spark: SparkSession, df: DataFrame, database: str,
             else:
                 select_exprs.append(f"NULLIF(s.[{stg_name}], '')")
 
+        # Eliminar registros previos de las cédulas que se van a insertar en el mes para permitir actualización inteligente
         merge_sql = f"""
+        DELETE t
+        FROM [dbo].[{clean_table}] t
+        INNER JOIN [dbo].[{staging_table}] s
+            ON t.[_mes_analisis] = s.[_mes_analisis]
+           AND t.[CEDULA] COLLATE DATABASE_DEFAULT = s.[CEDULA] COLLATE DATABASE_DEFAULT;
+
         WITH DeduplicatedStaging AS (
             SELECT *, ROW_NUMBER() OVER (PARTITION BY [_mes_analisis], [CEDULA] ORDER BY [_hash_registro]) AS _rn
             FROM [dbo].[{staging_table}]
@@ -175,18 +182,13 @@ def load_dataframe_idempotent(spark: SparkSession, df: DataFrame, database: str,
         INSERT INTO [dbo].[{clean_table}] ({cols_formatted}, [_fecha_carga])
         SELECT {', '.join(select_exprs)}, GETDATE()
         FROM DeduplicatedStaging s
-        WHERE s._rn = 1
-          AND NOT EXISTS (
-              SELECT 1 FROM [dbo].[{clean_table}] t
-              WHERE t.[_mes_analisis] = s.[_mes_analisis]
-                AND t.[CEDULA] = s.[CEDULA]
-          );
+        WHERE s._rn = 1;
         """
 
         logger.info(f"[{database}] Ejecutando sincronización idempotente hacia [dbo].[{clean_table}]...")
         cursor.execute(merge_sql)
         inserted_rows = cursor.rowcount
-        logger.info(f"[{database}] Sincronización completada. Nuevos registros insertados: {inserted_rows}")
+        logger.info(f"[{database}] Sincronización completada. Registros procesados/actualizados: {inserted_rows}")
 
         # 3. Limpiar tabla staging
         cursor.execute(f"DROP TABLE [dbo].[{staging_table}]")
@@ -196,4 +198,172 @@ def load_dataframe_idempotent(spark: SparkSession, df: DataFrame, database: str,
 
     finally:
         cursor.close()
+        conn.close()
+
+
+def load_new_architecture_dataset(
+    df_colab, 
+    df_serv, 
+    df_raw_courses, 
+    database: str
+):
+    """
+    Carga los datos del archivo Excel directamente en las tablas normalizadas de la nueva arquitectura:
+    1. dbo.BGD_MTZ_COL (Colaboradores por Sede y Cédula)
+    2. dbo.BGD_MTZ3100_SERVICIOS (Catálogo de Servicios)
+    3. dbo.BGD_MTZ_CURSOS_RAW (Cursos despivoteados con marcas y fechas originales)
+    """
+    conn = get_mssql_connection(database)
+    cur = conn.cursor()
+
+    try:
+        # 1. Asegurar tablas básicas si no existen
+        import os, re
+        schema_path = os.path.join(os.path.dirname(__file__), "schema_v2.sql")
+        if os.path.exists(schema_path):
+            with open(schema_path, "r", encoding="utf-8") as f:
+                schema_sql = f.read()
+            for b in re.split(r'^\s*GO\s*$', schema_sql, flags=re.MULTILINE | re.IGNORECASE):
+                clean_lines = [l for l in b.splitlines() if not l.strip().upper().startswith('USE ')]
+                cb = '\n'.join(clean_lines).strip()
+                if cb:
+                    cur.execute(cb)
+
+        # 2. Upsert Servicios en dbo.BGD_MTZ3100_SERVICIOS (primero para satisfacer FK)
+        if not df_serv.empty:
+            logger.info(f"[{database}] Sincronizando {len(df_serv)} servicios en dbo.BGD_MTZ3100_SERVICIOS...")
+            serv_tuples = [(row["COD_SERVICIO"], row["NOMBRE_SERVICIO"]) for _, row in df_serv.iterrows()]
+            cur.execute("""
+                CREATE TABLE #TmpServ (COD_SERVICIO VARCHAR(10), NOMBRE_SERVICIO NVARCHAR(150));
+            """)
+            cur.executemany("INSERT INTO #TmpServ (COD_SERVICIO, NOMBRE_SERVICIO) VALUES (%s, %s);", serv_tuples)
+            cur.execute("""
+                MERGE dbo.BGD_MTZ3100_SERVICIOS AS t
+                USING #TmpServ AS s
+                ON (t.COD_SERVICIO COLLATE DATABASE_DEFAULT = s.COD_SERVICIO COLLATE DATABASE_DEFAULT)
+                WHEN MATCHED THEN
+                    UPDATE SET 
+                        t.NOMBRE_SERVICIO = s.NOMBRE_SERVICIO,
+                        t.[FECHA CARGA] = SYSUTCDATETIME()
+                WHEN NOT MATCHED THEN
+                    INSERT (COD_SERVICIO, NOMBRE_SERVICIO, CATEGORIA, ESTADO, [FECHA CARGA])
+                    VALUES (s.COD_SERVICIO, s.NOMBRE_SERVICIO, 'GENERAL', 'ACTIVO', SYSUTCDATETIME());
+                DROP TABLE #TmpServ;
+            """)
+
+        # 3. Upsert Colaboradores en dbo.BGD_MTZ_COL
+        if not df_colab.empty:
+            logger.info(f"[{database}] Sincronizando {len(df_colab)} colaboradores en dbo.BGD_MTZ_COL...")
+            colab_tuples = [
+                (
+                    row["CEDULA"], row["SEDE"], row["NOMBRE_COLABORADOR"],
+                    row["CODIGO"], row["ESTADO"], row["CARGO"],
+                    row["COD_SERVICIO"], row["JEFE INMEDIATO"]
+                )
+                for _, row in df_colab.iterrows()
+            ]
+            cur.execute("""
+                CREATE TABLE #TmpColab (
+                    CEDULA NVARCHAR(12), SEDE VARCHAR(50), NOMBRE_COLABORADOR NVARCHAR(200),
+                    CODIGO NVARCHAR(50), ESTADO NVARCHAR(50), CARGO NVARCHAR(150),
+                    COD_SERVICIO VARCHAR(10), JEFE_INMEDIATO NVARCHAR(200)
+                );
+            """)
+            cur.executemany("""
+                INSERT INTO #TmpColab (CEDULA, SEDE, NOMBRE_COLABORADOR, CODIGO, ESTADO, CARGO, COD_SERVICIO, JEFE_INMEDIATO)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+            """, colab_tuples)
+
+            # Auto-provisionar cualquier servicio presente en colaboradores que no estuviera en el catálogo para no violar FK
+            cur.execute("""
+                INSERT INTO dbo.BGD_MTZ3100_SERVICIOS (COD_SERVICIO, NOMBRE_SERVICIO, CATEGORIA, ESTADO, [FECHA CARGA])
+                SELECT DISTINCT s.COD_SERVICIO, 'SERVICIO ' + s.COD_SERVICIO, 'GENERAL', 'ACTIVO', SYSUTCDATETIME()
+                FROM #TmpColab s
+                WHERE s.COD_SERVICIO IS NOT NULL AND RTRIM(LTRIM(s.COD_SERVICIO)) <> ''
+                  AND NOT EXISTS (
+                      SELECT 1 FROM dbo.BGD_MTZ3100_SERVICIOS serv
+                      WHERE serv.COD_SERVICIO COLLATE DATABASE_DEFAULT = s.COD_SERVICIO COLLATE DATABASE_DEFAULT
+                  );
+            """)
+            
+            cur.execute("""
+                MERGE dbo.BGD_MTZ_COL AS t
+                USING #TmpColab AS s
+                ON (t.CEDULA COLLATE DATABASE_DEFAULT = s.CEDULA COLLATE DATABASE_DEFAULT 
+                    AND t.SEDE COLLATE DATABASE_DEFAULT = s.SEDE COLLATE DATABASE_DEFAULT)
+                WHEN MATCHED THEN
+                    UPDATE SET 
+                        t.NOMBRE_COLABORADOR = s.NOMBRE_COLABORADOR,
+                        t.CODIGO = s.CODIGO,
+                        t.ESTADO = s.ESTADO,
+                        t.CARGO = s.CARGO,
+                        t.COD_SERVICIO = s.COD_SERVICIO,
+                        t.[JEFE INMEDIATO] = s.JEFE_INMEDIATO,
+                        t.[FECHA CARGA] = SYSUTCDATETIME()
+                WHEN NOT MATCHED THEN
+                    INSERT (CEDULA, SEDE, NOMBRE_COLABORADOR, CODIGO, ESTADO, CARGO, COD_SERVICIO, [JEFE INMEDIATO], [FECHA CARGA])
+                    VALUES (s.CEDULA, s.SEDE, s.NOMBRE_COLABORADOR, s.CODIGO, s.ESTADO, s.CARGO, s.COD_SERVICIO, s.JEFE_INMEDIATO, SYSUTCDATETIME());
+                DROP TABLE #TmpColab;
+            """)
+
+        # 4. Upsert Cursos Raw en dbo.BGD_MTZ_CURSOS_RAW
+        if not df_raw_courses.empty:
+            logger.info(f"[{database}] Insertando/actualizando {len(df_raw_courses)} cursos en dbo.BGD_MTZ_CURSOS_RAW...")
+            raw_tuples = [
+                (
+                    row["MES_ANALISIS"], row["SEDE"], row["CEDULA"],
+                    row["CURSO_ID"], row["CURSO_NOMBRE"], row["MARCA_ORIGEN"],
+                    row["FECHA_REAL_ORIGEN"], row["FECHA_VENC_ORIGEN"],
+                    row["LECTURA"], row["_archivo_origen"]
+                )
+                for _, row in df_raw_courses.iterrows()
+            ]
+            cur.execute("""
+                CREATE TABLE #TmpCursosRaw (
+                    MES_ANALISIS VARCHAR(10), SEDE VARCHAR(50), CEDULA NVARCHAR(12),
+                    CURSO_ID VARCHAR(10), CURSO_NOMBRE NVARCHAR(150), MARCA_ORIGEN VARCHAR(20),
+                    FECHA_REAL_ORIGEN DATE, FECHA_VENC_ORIGEN DATE, LECTURA VARCHAR(20),
+                    _archivo_origen NVARCHAR(255)
+                );
+            """)
+            
+            batch_size = 1000
+            for i in range(0, len(raw_tuples), batch_size):
+                cur.executemany("""
+                    INSERT INTO #TmpCursosRaw (
+                        MES_ANALISIS, SEDE, CEDULA, CURSO_ID, CURSO_NOMBRE, MARCA_ORIGEN,
+                        FECHA_REAL_ORIGEN, FECHA_VENC_ORIGEN, LECTURA, _archivo_origen
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+                """, raw_tuples[i:i + batch_size])
+
+            cur.execute("""
+                MERGE dbo.BGD_MTZ_CURSOS_RAW AS t
+                USING #TmpCursosRaw AS s
+                ON (t.MES_ANALISIS = s.MES_ANALISIS 
+                    AND t.SEDE COLLATE DATABASE_DEFAULT = s.SEDE COLLATE DATABASE_DEFAULT
+                    AND t.CEDULA COLLATE DATABASE_DEFAULT = s.CEDULA COLLATE DATABASE_DEFAULT
+                    AND t.CURSO_ID = s.CURSO_ID)
+                WHEN MATCHED THEN
+                    UPDATE SET 
+                        t.CURSO_NOMBRE = s.CURSO_NOMBRE,
+                        t.MARCA_ORIGEN = s.MARCA_ORIGEN,
+                        t.FECHA_REAL_ORIGEN = s.FECHA_REAL_ORIGEN,
+                        t.FECHA_VENC_ORIGEN = s.FECHA_VENC_ORIGEN,
+                        t.LECTURA = s.LECTURA,
+                        t._archivo_origen = s._archivo_origen,
+                        t._fecha_carga = SYSUTCDATETIME()
+                WHEN NOT MATCHED THEN
+                    INSERT (
+                        MES_ANALISIS, SEDE, CEDULA, CURSO_ID, CURSO_NOMBRE, MARCA_ORIGEN,
+                        FECHA_REAL_ORIGEN, FECHA_VENC_ORIGEN, LECTURA, _archivo_origen, _fecha_carga
+                    ) VALUES (
+                        s.MES_ANALISIS, s.SEDE, s.CEDULA, s.CURSO_ID, s.CURSO_NOMBRE, s.MARCA_ORIGEN,
+                        s.FECHA_REAL_ORIGEN, s.FECHA_VENC_ORIGEN, s.LECTURA, s._archivo_origen, SYSUTCDATETIME()
+                    );
+                DROP TABLE #TmpCursosRaw;
+            """)
+            logger.info(f"[{database}] Sincronización de dbo.BGD_MTZ_CURSOS_RAW finalizada exitosamente.")
+
+    finally:
+        cur.close()
         conn.close()
