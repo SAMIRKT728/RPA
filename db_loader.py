@@ -306,9 +306,9 @@ def load_new_architecture_dataset(
                 DROP TABLE #TmpColab;
             """)
 
-        # 4. Upsert Cursos Raw en dbo.BGD_MTZ_CURSOS_RAW
+        # 4. Inserción directa de cursos obligatorios en dbo.BGD_MTZ3100_DASH (sin tabla intermedia RAW)
         if not df_raw_courses.empty:
-            logger.info(f"[{database}] Insertando/actualizando {len(df_raw_courses)} cursos en dbo.BGD_MTZ_CURSOS_RAW...")
+            logger.info(f"[{database}] Procesando {len(df_raw_courses)} cursos e insertando directamente en dbo.BGD_MTZ3100_DASH...")
             raw_tuples = [
                 (
                     row["MES_ANALISIS"], row["SEDE"], row["CEDULA"],
@@ -337,32 +337,250 @@ def load_new_architecture_dataset(
                 """, raw_tuples[i:i + batch_size])
 
             cur.execute("""
-                MERGE dbo.BGD_MTZ_CURSOS_RAW AS t
-                USING #TmpCursosRaw AS s
+                ;WITH EvaluacionBase AS (
+                    SELECT 
+                        r.MES_ANALISIS,
+                        r.SEDE,
+                        r.CEDULA,
+                        c.NOMBRE_COLABORADOR,
+                        c.COD_SERVICIO,
+                        c.CARGO,
+                        r.CURSO_ID,
+                        cat.CURSO_NOMBRE AS CAT_CURSO_NOMBRE,
+                        r.MARCA_ORIGEN,
+                        r.FECHA_REAL_ORIGEN,
+                        r.FECHA_VENC_ORIGEN,
+                        ISNULL(r.LECTURA, 'OK') AS LECTURA,
+                        cat.VIGENCIA_MESES,
+                        aud.ID AS ID_AUDITORIA,
+                        aud.MOTIVO AS MOTIVO_AUDITORIA,
+                        dt.VENC_EFECTIVO,
+                        dt.REAL_EFECTIVA,
+                        obl.ES_OBLIGATORIO,
+                        fc.FECHA_CORTE
+                    FROM #TmpCursosRaw r
+                    INNER JOIN dbo.BGD_MTZ_COL c
+                        ON c.CEDULA COLLATE DATABASE_DEFAULT = r.CEDULA COLLATE DATABASE_DEFAULT
+                       AND c.SEDE COLLATE DATABASE_DEFAULT = r.SEDE COLLATE DATABASE_DEFAULT
+                    INNER JOIN dbo.BGD_MTZ3100_CATCURSO cat
+                        ON cat.ID_CURSO COLLATE DATABASE_DEFAULT = r.CURSO_ID COLLATE DATABASE_DEFAULT
+                    CROSS APPLY (
+                        SELECT EOMONTH(CONVERT(DATE, r.MES_ANALISIS + '-01')) AS FECHA_CORTE
+                    ) fc
+                    LEFT JOIN dbo.BGD_MTZ3100_AUDITORIA aud
+                        ON aud.CEDULA_COLABORADOR COLLATE DATABASE_DEFAULT = r.CEDULA COLLATE DATABASE_DEFAULT
+                       AND aud.CURSO_ID COLLATE DATABASE_DEFAULT = r.CURSO_ID COLLATE DATABASE_DEFAULT
+                       AND aud._activo = 1
+                    CROSS APPLY (
+                        SELECT 
+                            CASE 
+                                WHEN c.CARGO COLLATE Modern_Spanish_CI_AI = 'ENFERMERO (A) JEFE SERVICIO SOCIAL OBLIGATORIO' 
+                                    THEN 'ENFERMERO (A) JEFE'
+                                WHEN c.CARGO COLLATE Modern_Spanish_CI_AI IN ('MEDICO SERVICIO SOCIAL OBLIGATORIO', 'MEDICO SERVICIO OBLIGATORIO') 
+                                    THEN 'MEDICO GENERAL'
+                                ELSE c.CARGO
+                            END AS CARGO_NORMATIVO
+                    ) h
+                    CROSS APPLY (
+                        SELECT 
+                            CASE 
+                                WHEN EXISTS (
+                                    SELECT 1 
+                                    FROM dbo.BGD_MTZ_INDICE_OBLIGATORIEDAD ind
+                                    WHERE ind.ESTADO = 'ACTIVO'
+                                      AND ind.CARGO COLLATE Modern_Spanish_CI_AI = h.CARGO_NORMATIVO COLLATE Modern_Spanish_CI_AI
+                                ) THEN
+                                    CASE 
+                                        WHEN EXISTS (
+                                            SELECT 1 
+                                            FROM dbo.BGD_MTZ_INDICE_OBLIGATORIEDAD ind
+                                            WHERE ind.ESTADO = 'ACTIVO'
+                                              AND ind.CARGO COLLATE Modern_Spanish_CI_AI = h.CARGO_NORMATIVO COLLATE Modern_Spanish_CI_AI
+                                              AND (
+                                                  ind.COD_CURSO COLLATE Modern_Spanish_CI_AI = cat.CURSO_NOMBRE COLLATE Modern_Spanish_CI_AI
+                                                  OR ind.COD_CURSO COLLATE Modern_Spanish_CI_AI = r.CURSO_NOMBRE COLLATE Modern_Spanish_CI_AI
+                                              )
+                                              AND (
+                                                  ind.CODIGOS_SERVICIO = 'TODOS'
+                                                  OR (
+                                                      c.COD_SERVICIO IS NOT NULL AND c.COD_SERVICIO <> ''
+                                                      AND (
+                                                          ';' + ind.CODIGOS_SERVICIO + ';' LIKE '%;' + c.COD_SERVICIO + ';%'
+                                                          OR (TRY_CAST(c.COD_SERVICIO AS INT) IS NOT NULL 
+                                                              AND ';' + ind.CODIGOS_SERVICIO + ';' LIKE '%;' + RIGHT('0000' + CAST(TRY_CAST(c.COD_SERVICIO AS INT) AS VARCHAR(10)), 4) + ';%')
+                                                          OR (TRY_CAST(c.COD_SERVICIO AS INT) IS NOT NULL 
+                                                              AND ';' + ind.CODIGOS_SERVICIO + ';' LIKE '%;' + CAST(TRY_CAST(c.COD_SERVICIO AS INT) AS VARCHAR(10)) + ';%')
+                                                      )
+                                                  )
+                                              )
+                                        ) THEN 1
+                                        ELSE 0
+                                    END
+                                ELSE
+                                    CASE 
+                                        WHEN r.MARCA_ORIGEN IN ('SI', 'NO') THEN 1
+                                        ELSE 0
+                                    END
+                            END AS ES_OBLIGATORIO
+                    ) obl
+                    CROSS APPLY (
+                        SELECT 
+                            COALESCE(aud.FECHA_VENC_NEW, r.FECHA_VENC_ORIGEN, 
+                                     CASE WHEN COALESCE(aud.FECHA_REAL_NEW, r.FECHA_REAL_ORIGEN) IS NOT NULL 
+                                          THEN DATEADD(month, cat.VIGENCIA_MESES, COALESCE(aud.FECHA_REAL_NEW, r.FECHA_REAL_ORIGEN)) 
+                                          ELSE NULL END
+                            ) AS VENC_EFECTIVO,
+                            COALESCE(aud.FECHA_REAL_NEW, r.FECHA_REAL_ORIGEN) AS REAL_EFECTIVA
+                    ) dt
+                ),
+                EvaluacionSituaciones AS (
+                    SELECT 
+                        eb.*,
+                        CASE 
+                            WHEN eb.ES_OBLIGATORIO = 0 THEN 1
+                            WHEN eb.ID_AUDITORIA IS NOT NULL THEN
+                                CASE 
+                                    WHEN eb.VENC_EFECTIVO < eb.FECHA_CORTE THEN 5
+                                    WHEN eb.VENC_EFECTIVO < DATEADD(day, 90, eb.FECHA_CORTE) THEN 3
+                                    ELSE 2
+                                END
+                            WHEN eb.LECTURA = 'SIN_COLUMNA' THEN 9
+                            WHEN eb.VENC_EFECTIVO IS NULL AND eb.REAL_EFECTIVA IS NULL THEN 
+                                CASE 
+                                    WHEN eb.MARCA_ORIGEN IN ('SI', 'S') THEN 6
+                                    WHEN eb.MARCA_ORIGEN IN ('N/A', 'NA') THEN 8
+                                    ELSE 7
+                                END
+                            WHEN eb.VENC_EFECTIVO < eb.FECHA_CORTE THEN 
+                                CASE 
+                                    WHEN eb.MARCA_ORIGEN IN ('SI', 'S') THEN 4
+                                    ELSE 5
+                                END
+                            ELSE 
+                                CASE 
+                                    WHEN eb.MARCA_ORIGEN IN ('NO', 'N') THEN 10
+                                    WHEN eb.VENC_EFECTIVO < DATEADD(day, 90, eb.FECHA_CORTE) THEN 3
+                                    ELSE 2
+                                END
+                        END AS SITUACION_NUM
+                    FROM EvaluacionBase eb
+                ),
+                FiltradosObligatorios AS (
+                    SELECT 
+                        MES_ANALISIS,
+                        CEDULA,
+                        NOMBRE_COLABORADOR,
+                        SEDE,
+                        CURSO_ID,
+                        CAT_CURSO_NOMBRE AS CURSO_NOMBRE,
+                        MARCA_ORIGEN,
+                        FECHA_REAL_ORIGEN,
+                        FECHA_VENC_ORIGEN,
+                        LECTURA,
+                        'SI' AS OBLIGATORIO,
+                        VIGENCIA_MESES,
+                        VENC_EFECTIVO,
+                        REAL_EFECTIVA,
+                        CASE 
+                            WHEN SITUACION_NUM IN (2, 10) THEN 'VIGENTE'
+                            WHEN SITUACION_NUM = 3 THEN 'POR VENCER'
+                            WHEN SITUACION_NUM IN (4, 5) THEN 'VENCIDO'
+                            WHEN SITUACION_NUM = 6 THEN 'CUMPLE SIN FECHA'
+                            WHEN SITUACION_NUM IN (7, 8) THEN 'NO REALIZADO'
+                            WHEN SITUACION_NUM = 9 THEN 'SIN COLUMNA EN SEDE'
+                            ELSE 'NO APLICA'
+                        END AS ESTADO_DETALLADO,
+                        CASE 
+                            WHEN SITUACION_NUM IN (2, 3, 6, 10) THEN 'SI'
+                            ELSE 'NO'
+                        END AS MARCA,
+                        CASE 
+                            WHEN VENC_EFECTIVO IS NOT NULL THEN DATEDIFF(day, FECHA_CORTE, VENC_EFECTIVO)
+                            ELSE NULL
+                        END AS DIAS_PARA_VENCER,
+                        CASE 
+                            WHEN SITUACION_NUM IN (2, 3, 6, 10) THEN 1
+                            ELSE 0
+                        END AS CUENTA_INDICADOR,
+                        CASE 
+                            WHEN ID_AUDITORIA IS NOT NULL THEN 'SUBSANADO_AUDITORIA'
+                            WHEN SITUACION_NUM = 3 THEN 'ALERTA_POR_VENCER'
+                            WHEN SITUACION_NUM = 4 THEN 'MARCA_DESACTUALIZADA'
+                            WHEN SITUACION_NUM = 6 THEN 'FALTA_FECHA'
+                            WHEN SITUACION_NUM = 8 THEN 'DISCREPANCIA_APLICABILIDAD'
+                            WHEN SITUACION_NUM = 9 THEN 'SIN_COLUMNA'
+                            WHEN SITUACION_NUM = 10 THEN 'MARCA_DESACTUALIZADA'
+                            ELSE NULL
+                        END AS ALERTA,
+                        CASE 
+                            WHEN ID_AUDITORIA IS NOT NULL THEN CONCAT('Subsanado en Auditoría: ', MOTIVO_AUDITORIA)
+                            WHEN SITUACION_NUM = 3 THEN 'Suma al indicador pero se lista para gestión preventiva'
+                            WHEN SITUACION_NUM = 4 THEN 'La sede tenía SI pero el curso ya venció'
+                            WHEN SITUACION_NUM = 6 THEN 'Suma al indicador pero requiere solicitud de soporte a la sede'
+                            WHEN SITUACION_NUM = 8 THEN 'La sede indicó N/A pero la norma lo exige'
+                            WHEN SITUACION_NUM = 9 THEN 'La sede no registra este curso; no puede evaluarse cumplimiento'
+                            WHEN SITUACION_NUM = 10 THEN 'La sede marcó NO pero la fecha registrada indica vigencia'
+                            ELSE NULL
+                        END AS OBSERVACION,
+                        ID_AUDITORIA AS SUBSANADO_CONTROL_CALIDAD,
+                        SYSUTCDATETIME() AS FECHA_CALCULO
+                    FROM EvaluacionSituaciones
+                    WHERE SITUACION_NUM <> 1 -- Solo cursos obligatorios
+                )
+                MERGE dbo.BGD_MTZ3100_DASH AS t
+                USING FiltradosObligatorios AS s
                 ON (t.MES_ANALISIS = s.MES_ANALISIS 
                     AND t.SEDE COLLATE DATABASE_DEFAULT = s.SEDE COLLATE DATABASE_DEFAULT
                     AND t.CEDULA COLLATE DATABASE_DEFAULT = s.CEDULA COLLATE DATABASE_DEFAULT
-                    AND t.CURSO_ID = s.CURSO_ID)
+                    AND t.CURSO_ID COLLATE DATABASE_DEFAULT = s.CURSO_ID COLLATE DATABASE_DEFAULT)
                 WHEN MATCHED THEN
                     UPDATE SET 
+                        t.NOMBRE_COLABORADOR = s.NOMBRE_COLABORADOR,
                         t.CURSO_NOMBRE = s.CURSO_NOMBRE,
                         t.MARCA_ORIGEN = s.MARCA_ORIGEN,
                         t.FECHA_REAL_ORIGEN = s.FECHA_REAL_ORIGEN,
                         t.FECHA_VENC_ORIGEN = s.FECHA_VENC_ORIGEN,
                         t.LECTURA = s.LECTURA,
-                        t._archivo_origen = s._archivo_origen,
-                        t._fecha_carga = SYSUTCDATETIME()
+                        t.OBLIGATORIO = s.OBLIGATORIO,
+                        t.VIGENCIA_MESES = s.VIGENCIA_MESES,
+                        t.VENC_EFECTIVO = s.VENC_EFECTIVO,
+                        t.REAL_EFECTIVA = s.REAL_EFECTIVA,
+                        t.ESTADO_DETALLADO = s.ESTADO_DETALLADO,
+                        t.MARCA = s.MARCA,
+                        t.DIAS_PARA_VENCER = s.DIAS_PARA_VENCER,
+                        t.CUENTA_INDICADOR = s.CUENTA_INDICADOR,
+                        t.ALERTA = s.ALERTA,
+                        t.OBSERVACION = s.OBSERVACION,
+                        t.SUBSANADO_CONTROL_CALIDAD = s.SUBSANADO_CONTROL_CALIDAD,
+                        t.FECHA_CALCULO = s.FECHA_CALCULO
                 WHEN NOT MATCHED THEN
                     INSERT (
-                        MES_ANALISIS, SEDE, CEDULA, CURSO_ID, CURSO_NOMBRE, MARCA_ORIGEN,
-                        FECHA_REAL_ORIGEN, FECHA_VENC_ORIGEN, LECTURA, _archivo_origen, _fecha_carga
+                        MES_ANALISIS, CEDULA, NOMBRE_COLABORADOR, SEDE, MULTISEDE,
+                        CURSO_ID, CURSO_NOMBRE, MARCA_ORIGEN, FECHA_REAL_ORIGEN, FECHA_VENC_ORIGEN,
+                        LECTURA, OBLIGATORIO, VIGENCIA_MESES, VENC_EFECTIVO, REAL_EFECTIVA,
+                        ESTADO_DETALLADO, MARCA, DIAS_PARA_VENCER, CUENTA_INDICADOR,
+                        ALERTA, OBSERVACION, SUBSANADO_CONTROL_CALIDAD, FECHA_CALCULO
                     ) VALUES (
-                        s.MES_ANALISIS, s.SEDE, s.CEDULA, s.CURSO_ID, s.CURSO_NOMBRE, s.MARCA_ORIGEN,
-                        s.FECHA_REAL_ORIGEN, s.FECHA_VENC_ORIGEN, s.LECTURA, s._archivo_origen, SYSUTCDATETIME()
+                        s.MES_ANALISIS, s.CEDULA, s.NOMBRE_COLABORADOR, s.SEDE, 'NO',
+                        s.CURSO_ID, s.CURSO_NOMBRE, s.MARCA_ORIGEN, s.FECHA_REAL_ORIGEN, s.FECHA_VENC_ORIGEN,
+                        s.LECTURA, s.OBLIGATORIO, s.VIGENCIA_MESES, s.VENC_EFECTIVO, s.REAL_EFECTIVA,
+                        s.ESTADO_DETALLADO, s.MARCA, s.DIAS_PARA_VENCER, s.CUENTA_INDICADOR,
+                        s.ALERTA, s.OBSERVACION, s.SUBSANADO_CONTROL_CALIDAD, s.FECHA_CALCULO
                     );
+
+                -- Actualizar Multisede
+                ;WITH MultisedeCheck AS (
+                    SELECT CEDULA FROM dbo.BGD_MTZ_COL GROUP BY CEDULA HAVING COUNT(DISTINCT SEDE) > 1
+                )
+                UPDATE d
+                SET d.MULTISEDE = 'SI'
+                FROM dbo.BGD_MTZ3100_DASH d
+                INNER JOIN MultisedeCheck m
+                    ON m.CEDULA COLLATE DATABASE_DEFAULT = d.CEDULA COLLATE DATABASE_DEFAULT;
+
                 DROP TABLE #TmpCursosRaw;
             """)
-            logger.info(f"[{database}] Sincronización de dbo.BGD_MTZ_CURSOS_RAW finalizada exitosamente.")
+            logger.info(f"[{database}] Sincronización directa en dbo.BGD_MTZ3100_DASH finalizada exitosamente.")
 
     finally:
         cur.close()

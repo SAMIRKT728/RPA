@@ -37,19 +37,16 @@ class Config:
     SPARK_APP_NAME: str = os.getenv("SPARK_APP_NAME", "RPA_Drive_To_SQLServer")
 
 
-# Mapeo con iniciales cortas:
-# alta -> A (DGEMPRES01) -> BGD_MATRIZ_3100_A
-# centro -> C (DGEMPRES01) -> BGD_MATRIZ_3100_C
-# aguachica -> AG (DGEMPRES30) -> BGD_MATRIZ_3100_AG
-# san juan -> SJ (DGEMPRES70) -> BGD_MATRIZ_3100_SJ
-# valle -> V (DGEMPRES80) -> BGD_MATRIZ_3100_V
+# Mapeo con nombres completos de sede:
+# ALTA, AGUACHICA, CENTRO, VALLEDUPAR, SAN JUAN
 SEDE_MAPPINGS: Dict[str, Tuple[str, str]] = {
-    "alta": ("DGEMPRES01", "A"),
-    "centro": ("DGEMPRES01", "C"),
-    "aguachica": ("DGEMPRES30", "AG"),
-    "san juan": ("DGEMPRES70", "SJ"),
-    "sanjuan": ("DGEMPRES70", "SJ"),
-    "valle": ("DGEMPRES80", "V"),
+    "alta": ("DGEMPRES01", "ALTA"),
+    "centro": ("DGEMPRES01", "CENTRO"),
+    "aguachica": ("DGEMPRES30", "AGUACHICA"),
+    "san juan": ("DGEMPRES70", "SAN JUAN"),
+    "sanjuan": ("DGEMPRES70", "SAN JUAN"),
+    "valledupar": ("DGEMPRES80", "VALLEDUPAR"),
+    "valle": ("DGEMPRES80", "VALLEDUPAR"),
 }
 
 
