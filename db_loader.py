@@ -374,10 +374,16 @@ def load_new_architecture_dataset(
                     CROSS APPLY (
                         SELECT 
                             CASE 
-                                WHEN c.CARGO COLLATE Modern_Spanish_CI_AI = 'ENFERMERO (A) JEFE SERVICIO SOCIAL OBLIGATORIO' 
-                                    THEN 'ENFERMERO (A) JEFE'
-                                WHEN c.CARGO COLLATE Modern_Spanish_CI_AI IN ('MEDICO SERVICIO SOCIAL OBLIGATORIO', 'MEDICO SERVICIO OBLIGATORIO') 
-                                    THEN 'MEDICO GENERAL'
+                                WHEN c.CARGO COLLATE Modern_Spanish_CI_AI IN (
+                                    'ENFERMERO (A) JEFE', 'ENFERMERO JEFE', 'ENFERMERA JEFE', 
+                                    'ENFERMERO (A) JEFE AC', 'ENFERMERO (A) JEFE SERVICIO SOCIAL OBLIGATORIO',
+                                    'COORDINADOR (A) DE ENFERMERIA'
+                                ) THEN 'ENFERMERO (A) JEFE AC'
+                                WHEN c.CARGO COLLATE Modern_Spanish_CI_AI IN (
+                                    'MEDICO GENERAL', 'MEDICO GENERAL AC',
+                                    'MEDICO SERVICIO SOCIAL OBLIGATORIO', 'MEDICO SERVICIO OBLIGATORIO',
+                                    'COORDINADOR (A) MEDICO'
+                                ) THEN 'MEDICO GENERAL AC'
                                 ELSE c.CARGO
                             END AS CARGO_NORMATIVO
                     ) h
@@ -388,14 +394,20 @@ def load_new_architecture_dataset(
                                     SELECT 1 
                                     FROM dbo.BGD_MTZ_INDICE_OBLIGATORIEDAD ind
                                     WHERE ind.ESTADO = 'ACTIVO'
-                                      AND ind.CARGO COLLATE Modern_Spanish_CI_AI = h.CARGO_NORMATIVO COLLATE Modern_Spanish_CI_AI
+                                      AND (
+                                          ind.CARGO COLLATE Modern_Spanish_CI_AI = h.CARGO_NORMATIVO COLLATE Modern_Spanish_CI_AI
+                                          OR ind.CARGO COLLATE Modern_Spanish_CI_AI = h.CARGO_NORMATIVO + ' AC' COLLATE Modern_Spanish_CI_AI
+                                      )
                                 ) THEN
                                     CASE 
                                         WHEN EXISTS (
                                             SELECT 1 
                                             FROM dbo.BGD_MTZ_INDICE_OBLIGATORIEDAD ind
                                             WHERE ind.ESTADO = 'ACTIVO'
-                                              AND ind.CARGO COLLATE Modern_Spanish_CI_AI = h.CARGO_NORMATIVO COLLATE Modern_Spanish_CI_AI
+                                              AND (
+                                                  ind.CARGO COLLATE Modern_Spanish_CI_AI = h.CARGO_NORMATIVO COLLATE Modern_Spanish_CI_AI
+                                                  OR ind.CARGO COLLATE Modern_Spanish_CI_AI = h.CARGO_NORMATIVO + ' AC' COLLATE Modern_Spanish_CI_AI
+                                              )
                                               AND (
                                                   ind.COD_CURSO COLLATE Modern_Spanish_CI_AI = cat.CURSO_NOMBRE COLLATE Modern_Spanish_CI_AI
                                                   OR ind.COD_CURSO COLLATE Modern_Spanish_CI_AI = r.CURSO_NOMBRE COLLATE Modern_Spanish_CI_AI
