@@ -1,0 +1,9 @@
+pyspark>=3.5.0
+pandas>=2.0.0
+openpyxl>=3.1.0
+python-dotenv>=1.0.0
+google-api-python-client>=2.100.0
+google-auth-oauthlib>=1.0.0
+google-auth-httplib2>=0.2.0
+pymssql>=2.2.0
+sqlalchemy>=2.0.0
