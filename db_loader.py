@@ -1,6 +1,7 @@
 import logging
 import hashlib
 from typing import List, Optional, Tuple
+import pandas as pd
 import pymssql
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
@@ -11,6 +12,30 @@ from pyspark.sql.types import (
 from config import config
 
 logger = logging.getLogger("RPA.DbLoader")
+
+
+def _format_sql_value(val):
+    if val is None or pd.isna(val) or str(val).strip() in ('', 'None', 'nan', '<NA>'):
+        return 'NULL'
+    cleaned = str(val).replace("'", "''")
+    return f"'{cleaned}'"
+
+
+def _fast_batch_insert(cur, table_name: str, columns: List[str], rows: List[Tuple], batch_size: int = 1000):
+    """
+    Inserta masivamente registros en SQL Server usando bloques multi-fila VALUES en lugar de
+    ejecutar sentencias individuales con executemany. Reduce el tiempo de red drásticamente.
+    """
+    if not rows:
+        return
+    cols_str = ", ".join([f"[{c}]" for c in columns])
+    for i in range(0, len(rows), batch_size):
+        chunk = rows[i:i + batch_size]
+        values_list = []
+        for r in chunk:
+            row_vals = ", ".join([_format_sql_value(v) for v in r])
+            values_list.append(f"({row_vals})")
+        cur.execute(f"INSERT INTO {table_name} ({cols_str}) VALUES {','.join(values_list)};")
 
 
 def get_mssql_connection(database: str):
@@ -236,7 +261,7 @@ def load_new_architecture_dataset(
             cur.execute("""
                 CREATE TABLE #TmpServ (COD_SERVICIO VARCHAR(10), NOMBRE_SERVICIO NVARCHAR(150));
             """)
-            cur.executemany("INSERT INTO #TmpServ (COD_SERVICIO, NOMBRE_SERVICIO) VALUES (%s, %s);", serv_tuples)
+            _fast_batch_insert(cur, "#TmpServ", ["COD_SERVICIO", "NOMBRE_SERVICIO"], serv_tuples)
             cur.execute("""
                 MERGE dbo.BGD_MTZ3100_SERVICIOS AS t
                 USING #TmpServ AS s
@@ -269,10 +294,11 @@ def load_new_architecture_dataset(
                     COD_SERVICIO VARCHAR(10), JEFE_INMEDIATO NVARCHAR(200)
                 );
             """)
-            cur.executemany("""
-                INSERT INTO #TmpColab (CEDULA, SEDE, NOMBRE_COLABORADOR, CODIGO, ESTADO, CARGO, COD_SERVICIO, JEFE_INMEDIATO)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
-            """, colab_tuples)
+            _fast_batch_insert(
+                cur, "#TmpColab",
+                ["CEDULA", "SEDE", "NOMBRE_COLABORADOR", "CODIGO", "ESTADO", "CARGO", "COD_SERVICIO", "JEFE_INMEDIATO"],
+                colab_tuples
+            )
 
             # Auto-provisionar cualquier servicio presente en colaboradores que no estuviera en el catálogo para no violar FK
             cur.execute("""
@@ -327,14 +353,18 @@ def load_new_architecture_dataset(
                 );
             """)
             
-            batch_size = 1000
-            for i in range(0, len(raw_tuples), batch_size):
-                cur.executemany("""
-                    INSERT INTO #TmpCursosRaw (
-                        MES_ANALISIS, SEDE, CEDULA, CURSO_ID, CURSO_NOMBRE, MARCA_ORIGEN,
-                        FECHA_REAL_ORIGEN, FECHA_VENC_ORIGEN, LECTURA, _archivo_origen
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
-                """, raw_tuples[i:i + batch_size])
+            _fast_batch_insert(
+                cur, "#TmpCursosRaw",
+                [
+                    "MES_ANALISIS", "SEDE", "CEDULA", "CURSO_ID", "CURSO_NOMBRE",
+                    "MARCA_ORIGEN", "FECHA_REAL_ORIGEN", "FECHA_VENC_ORIGEN",
+                    "LECTURA", "_archivo_origen"
+                ],
+                raw_tuples,
+                batch_size=1000
+            )
+
+            cur.execute("CREATE CLUSTERED INDEX CIX_TmpCursosRaw ON #TmpCursosRaw (CEDULA, CURSO_ID);")
 
             cur.execute("""
                 ;WITH EvaluacionBase AS (

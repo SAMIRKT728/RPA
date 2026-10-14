@@ -7,8 +7,7 @@ from datetime import datetime, date, timedelta
 from typing import Optional
 from config import config, resolve_db_and_table
 from google_drive_client import list_files_in_drive, list_subfolders, download_file_to_bytes
-from spark_session import get_spark_session
-from db_loader import load_dataframe_idempotent, get_mssql_connection
+from db_loader import get_mssql_connection
 
 # Configurar logging
 os.makedirs("logs", exist_ok=True)
@@ -191,11 +190,11 @@ def execute_dashboard_stored_procedures(fecha_corte_str: str = None, mes_analisi
         conn.close()
 
 
-def process_excel_buffer_with_spark(spark, buffer, filename: str, database: str, table_name: str, dry_run: bool = False, mes_analisis: Optional[str] = None, sede: str = "GENERAL"):
+def process_excel_buffer(buffer, filename: str, database: str, table_name: str, dry_run: bool = False, mes_analisis: Optional[str] = None, sede: str = "GENERAL", spark=None):
     """
     Lee un buffer Excel (.xlsx), aplica la estandarización y limpieza integral de datos,
-    carga en la nueva arquitectura normalizada (BGD_MTZ_COL, BGD_MTZ3100_SERVICIOS, BGD_MTZ_CURSOS_RAW)
-    y sincroniza la tabla con PySpark.
+    y carga en la nueva arquitectura normalizada (BGD_MTZ_COL, BGD_MTZ3100_SERVICIOS, BGD_MTZ3100_DASH)
+    de forma directa, rápida y sin tablas intermedias obsoletas.
     """
     logger.info(f"Leyendo contenido de '{filename}' (sin validación de colores)...")
     from data_standardizer import read_excel_with_styles, clean_and_standardize_dataframe, unpivot_courses_to_raw_dataset
@@ -212,44 +211,33 @@ def process_excel_buffer_with_spark(spark, buffer, filename: str, database: str,
         return 0
 
     if dry_run:
-        logger.info(f"[DRY-RUN] Destino previsto: Base de datos='{database}', Tabla='{table_name}'. No se escribirán datos.")
+        logger.info(f"[DRY-RUN] Destino previsto: Base de datos='{database}', Sede='{sede}'. No se escribirán datos.")
         return row_count
 
     target_mes = mes_analisis or (df_pandas["_mes_analisis"].iloc[0] if "_mes_analisis" in df_pandas.columns else datetime.now().strftime("%Y-%m"))
 
-    # 1. Cargar en la nueva arquitectura normalizada (BGD_MTZ_COL, BGD_MTZ3100_SERVICIOS, BGD_MTZ_CURSOS_RAW)
+    # Cargar en la arquitectura normalizada directamente a SQL Server
     norm_inserted = 0
     try:
         df_colab, df_serv, df_raw_courses = unpivot_courses_to_raw_dataset(df_pandas, sede=sede, mes_analisis=target_mes, filename=filename)
         load_new_architecture_dataset(df_colab, df_serv, df_raw_courses, database=database)
-        norm_inserted = len(df_raw_courses)
+        norm_inserted = len(df_colab)
     except Exception as ex_norm:
-        logger.error(f"Error al cargar en nueva arquitectura: {ex_norm}")
+        logger.error(f"Error al cargar en arquitectura normalizada: {ex_norm}")
         raise
 
-    # 2. Cargar en tabla de sede con PySpark (retrocompatibilidad si la tabla existe o se requiere)
-    inserted = norm_inserted
-    try:
-        logger.info("Transformando a DataFrame de PySpark para tabla legada...")
-        df_spark_prep = df_pandas.fillna("").astype(str).replace({"nan": "", "None": "", "<NA>": ""})
-        spark_df = spark.createDataFrame(df_spark_prep)
-        inserted = load_dataframe_idempotent(spark, spark_df, database, table_name, filename)
-    except Exception as ex_spark:
-        logger.warning(f"Omitiendo carga en tabla legada '{table_name}': {ex_spark}")
+    return norm_inserted
 
-    return inserted
+
+# Alias para retrocompatibilidad
+process_excel_buffer_with_spark = process_excel_buffer
 
 
 def run_rpa(folder_id: str = None, pattern: str = "MATRIZ 3100", local_file: str = None, dry_run: bool = False, fecha_corte: str = None, mes_analisis: str = None, mes: str = None):
     """Orquesta el ciclo completo de la RPA."""
     logger.info("======================================================")
-    logger.info("INICIANDO PROCESO RPA - DRIVE A SQL SERVER CON PYSPARK")
+    logger.info("INICIANDO PROCESO RPA - DRIVE A SQL SERVER")
     logger.info("======================================================")
-
-    # 1. Iniciar sesión de PySpark
-    logger.info("Inicializando sesión de PySpark...")
-    spark = get_spark_session()
-    logger.info("Sesión de PySpark iniciada correctamente.")
 
     try:
         # Caso A: Procesar un archivo local para pruebas o contingencia
@@ -261,12 +249,12 @@ def run_rpa(folder_id: str = None, pattern: str = "MATRIZ 3100", local_file: str
                 return
 
             database, table_name, sede = mapping
-            logger.info(f"Archivo: '{filename}' -> Sede: {sede} -> BD: {database} -> Tabla: {table_name}")
+            logger.info(f"Archivo: '{filename}' -> Sede: {sede} -> BD: {database}")
 
             with open(local_file, "rb") as f:
                 import io
                 buf = io.BytesIO(f.read())
-                process_excel_buffer_with_spark(spark, buf, filename, database, table_name, dry_run, mes_analisis=mes_analisis, sede=sede)
+                process_excel_buffer(buf, filename, database, table_name, dry_run, mes_analisis=mes_analisis, sede=sede)
             return
 
         # Caso B: Procesar desde Google Drive (con soporte de subcarpetas por mes)
@@ -321,7 +309,7 @@ def run_rpa(folder_id: str = None, pattern: str = "MATRIZ 3100", local_file: str
                 buffer = download_file_to_bytes(file_id, mime_type)
 
                 # Procesar y subir a la nueva arquitectura y a SQL Server
-                inserted = process_excel_buffer_with_spark(spark, buffer, filename, database, table_name, dry_run, mes_analisis=target_mes, sede=sede)
+                inserted = process_excel_buffer(buffer, filename, database, table_name, dry_run, mes_analisis=target_mes, sede=sede)
                 total_inserted += inserted
                 processed_count += 1
 
@@ -329,7 +317,7 @@ def run_rpa(folder_id: str = None, pattern: str = "MATRIZ 3100", local_file: str
             grand_total_files += processed_count
 
             logger.info("======================================================")
-            logger.info(f"RESUMEN LOTE '{batch_name}': {processed_count} archivos procesados. Total nuevos registros insertados: {total_inserted}")
+            logger.info(f"RESUMEN LOTE '{batch_name}': {processed_count} archivos procesados. Total nuevos colaboradores registrados: {total_inserted}")
             logger.info("======================================================")
 
             # Ejecutar Stored Procedures v2 de cálculo normativo (Jefes, Dashboard y Resumen Mes)
@@ -343,20 +331,16 @@ def run_rpa(folder_id: str = None, pattern: str = "MATRIZ 3100", local_file: str
                     logger.error(f"Error al ejecutar stored procedures de cálculo normativo: {str(ex_calc)}")
 
         logger.info("======================================================")
-        logger.info(f"RESUMEN TOTAL RPA: {grand_total_files} archivos procesados. Total nuevos registros insertados: {grand_total_inserted}")
+        logger.info(f"RESUMEN TOTAL RPA: {grand_total_files} archivos procesados. Total colaboradores registrados: {grand_total_inserted}")
         logger.info("======================================================")
 
     except Exception as e:
         logger.exception(f"Error crítico durante la ejecución de la RPA: {str(e)}")
         raise
-    finally:
-        logger.info("Deteniendo sesión de PySpark...")
-        spark.stop()
-        logger.info("Sesión de PySpark finalizada.")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="RPA PySpark Google Drive a SQL Server")
+    parser = argparse.ArgumentParser(description="RPA Google Drive a SQL Server")
     parser.add_argument("--dry-run", action="store_true", help="Ejecuta en modo simulación sin escribir en la base de datos")
     parser.add_argument("--folder-id", type=str, default=None, help="ID de la carpeta en Google Drive")
     parser.add_argument("--pattern", type=str, default="MATRIZ 3100", help="Patrón de búsqueda de archivos")
