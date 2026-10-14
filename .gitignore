@@ -25,4 +25,5 @@ logs/
 *.swp
 *.swo
 .DS_Store
-Thumbs.db
+# Archivos de análisis temporal
+AnalisisNuevoprocedure.xlsx
