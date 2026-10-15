@@ -22,11 +22,22 @@ AS
 BEGIN
     SET NOCOUNT ON;
 
-    -- 1. Si no se especifica fecha de corte, toma la última fecha disponible
+    -- 1. Si no se especifica fecha de corte, toma la última fecha disponible desde DASH
+    DECLARE @MesAnalisis VARCHAR(10);
     IF @FechaCorte IS NULL
-        SET @FechaCorte = EOMONTH(DATEADD(month, -1, GETDATE()));
+    BEGIN
+        SELECT TOP 1 @MesAnalisis = MES_ANALISIS 
+        FROM dbo.BGD_MTZ3100_DASH 
+        ORDER BY MES_ANALISIS DESC;
 
-    DECLARE @MesAnalisis VARCHAR(10) = FORMAT(@FechaCorte, 'yyyy-MM');
+        IF @MesAnalisis IS NOT NULL
+            SET @FechaCorte = EOMONTH(CAST(@MesAnalisis + '-01' AS DATE));
+        ELSE
+            SET @FechaCorte = EOMONTH(DATEADD(month, -1, GETDATE()));
+    END;
+
+    IF @MesAnalisis IS NULL
+        SET @MesAnalisis = FORMAT(@FechaCorte, 'yyyy-MM');
 
     PRINT '=======================================================';
     PRINT 'Iniciando dbo.SP_POBLAR_BGD_MTZ3100_RESUMEN_V2';
