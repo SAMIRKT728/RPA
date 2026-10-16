@@ -80,6 +80,11 @@ STANDARD_COURSES: Set[str] = {
     "DIPLOMADO CUIDADO INTENSIVO DE PACIENTE QUEMADO",
     "DIPLOMADO URGENCIAS",
     "CURSO DE SEGURIDAD DEL PACIENTE",
+    "SEGURIDAD DEL PACIENTE",
+    "TRASLADO Y MOVILIZACION DE PACIENTES",
+    "TRASLADO Y MOVILIZACIÓN DE PACIENTES",
+    "MOVILIZACION DE PACIENTES",
+    "MOVILIZACIÓN DE PACIENTES",
     "DIPLOMADO EN NEFROLOGÍA"
 }
 
@@ -105,7 +110,10 @@ def is_course_column(col_name: str) -> bool:
     name_upper = col_name.strip().upper()
     if name_upper in STANDARD_COURSES:
         return True
-    course_keywords = ["DIPLOMADO", "CURSO", "TALLER", "CERTIFICACION", "CAPACITACION", "INDUCCION"]
+    course_keywords = [
+        "DIPLOMADO", "CURSO", "TALLER", "CERTIFICACION", "CAPACITACION", 
+        "INDUCCION", "MOVILIZACION", "MOVILIZACIÓN"
+    ]
     return any(k in name_upper for k in course_keywords)
 
 
@@ -393,6 +401,10 @@ def clean_and_standardize_dataframe(df_raw: pd.DataFrame, filename: str, mes_ana
             c_clean = "ADMINISTRACIÓN DE MEDICAMENTOS"
         elif c_clean == "VIOLENCIA SEXUAL":
             c_clean = "ATENCION A LAS VICTIMAS DE VIOLENCIA SEXUAL"
+        elif c_clean in ("TRASLADO Y MOVILIZACION DE PACIENTES", "TRASLADO Y MOVILIZACIÓN DE PACIENTES", "MOVILIZACION DE PACIENTES", "MOVILIZACIÓN DE PACIENTES"):
+            c_clean = "TRASLADO Y MOVILIZACION DE PACIENTES"
+        elif c_clean in ("CURSO DE SEGURIDAD DEL PACIENTE", "SEGURIDAD DEL PACIENTE"):
+            c_clean = "CURSO DE SEGURIDAD DEL PACIENTE"
 
         if c_clean in seen:
             seen[c_clean] += 1
