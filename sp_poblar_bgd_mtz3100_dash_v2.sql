@@ -92,26 +92,20 @@ BEGIN
         LEFT JOIN dbo.BGD_MTZ3100_AUDITORIA aud
             ON aud.CEDULA_COLABORADOR COLLATE DATABASE_DEFAULT = d.CEDULA COLLATE DATABASE_DEFAULT
            AND aud.CURSO_ID COLLATE DATABASE_DEFAULT = d.CURSO_ID COLLATE DATABASE_DEFAULT
-           AND aud._activo = 1
+            AND aud._activo = 1
+        LEFT JOIN dbo.BGD_MTZ_ALIAS_CARGOS al
+            ON al.CARGO_EN_MATRIZ COLLATE Modern_Spanish_CI_AI = c.CARGO COLLATE Modern_Spanish_CI_AI
         CROSS APPLY (
             SELECT 
-                CASE 
-                    WHEN c.CARGO COLLATE Modern_Spanish_CI_AI IN (
-                        'ENFERMERO (A) JEFE', 'ENFERMERO JEFE', 'ENFERMERA JEFE', 
-                        'ENFERMERO (A) JEFE AC', 'ENFERMERO (A) JEFE SERVICIO SOCIAL OBLIGATORIO',
-                        'COORDINADOR (A) DE ENFERMERIA'
-                    ) THEN 'ENFERMERO (A) JEFE AC'
-                    WHEN c.CARGO COLLATE Modern_Spanish_CI_AI IN (
-                        'MEDICO GENERAL', 'MEDICO GENERAL AC',
-                        'MEDICO SERVICIO SOCIAL OBLIGATORIO', 'MEDICO SERVICIO OBLIGATORIO',
-                        'COORDINADOR (A) MEDICO'
-                    ) THEN 'MEDICO GENERAL AC'
-                    ELSE c.CARGO
-                END AS CARGO_NORMATIVO
+                COALESCE(NULLIF(al.CARGO_EN_INDICE, ''), c.CARGO) AS CARGO_NORMATIVO,
+                ISNULL(al.EXCLUIDO, 0) AS CARGO_EXCLUIDO
         ) h
         CROSS APPLY (
             SELECT 
                 CASE 
+                    -- Si el cargo está marcado como EXCLUIDO en la tabla de alias (ej. Psicología, Nutrición)
+                    WHEN h.CARGO_EXCLUIDO = 1 THEN 0
+
                     -- Si el cargo figura en la matriz de obligatoriedad
                     WHEN EXISTS (
                         SELECT 1 
@@ -140,11 +134,11 @@ BEGIN
                                       OR (
                                           c.COD_SERVICIO IS NOT NULL AND c.COD_SERVICIO <> ''
                                           AND (
-                                              ';' + ind.CODIGOS_SERVICIO + ';' LIKE '%;' + c.COD_SERVICIO + ';%'
+                                              ';' + ind.CODIGOS_SERVICIO + ';' LIKE CHAR(37) + ';' + c.COD_SERVICIO + ';' + CHAR(37)
                                               OR (TRY_CAST(c.COD_SERVICIO AS INT) IS NOT NULL 
-                                                  AND ';' + ind.CODIGOS_SERVICIO + ';' LIKE '%;' + RIGHT('0000' + CAST(TRY_CAST(c.COD_SERVICIO AS INT) AS VARCHAR(10)), 4) + ';%')
+                                                  AND ';' + ind.CODIGOS_SERVICIO + ';' LIKE CHAR(37) + ';' + RIGHT('0000' + CAST(TRY_CAST(c.COD_SERVICIO AS INT) AS VARCHAR(10)), 4) + ';' + CHAR(37))
                                               OR (TRY_CAST(c.COD_SERVICIO AS INT) IS NOT NULL 
-                                                  AND ';' + ind.CODIGOS_SERVICIO + ';' LIKE '%;' + CAST(TRY_CAST(c.COD_SERVICIO AS INT) AS VARCHAR(10)) + ';%')
+                                                  AND ';' + ind.CODIGOS_SERVICIO + ';' LIKE CHAR(37) + ';' + CAST(TRY_CAST(c.COD_SERVICIO AS INT) AS VARCHAR(10)) + ';' + CHAR(37))
                                           )
                                       )
                                   )
@@ -162,7 +156,7 @@ BEGIN
         CROSS APPLY (
             SELECT 
                 COALESCE(aud.FECHA_VENC_NEW, d.FECHA_VENC_ORIGEN, 
-                         CASE WHEN COALESCE(aud.FECHA_REAL_NEW, d.FECHA_REAL_ORIGEN) IS NOT NULL 
+                         CASE WHEN cat.VIGENCIA_MESES > 0 AND COALESCE(aud.FECHA_REAL_NEW, d.FECHA_REAL_ORIGEN) IS NOT NULL 
                               THEN DATEADD(month, cat.VIGENCIA_MESES, COALESCE(aud.FECHA_REAL_NEW, d.FECHA_REAL_ORIGEN)) 
                               ELSE NULL END
                 ) AS VENC_EFECTIVO,

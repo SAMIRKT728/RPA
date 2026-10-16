@@ -411,25 +411,20 @@ def load_new_architecture_dataset(
                         ON aud.CEDULA_COLABORADOR COLLATE DATABASE_DEFAULT = r.CEDULA COLLATE DATABASE_DEFAULT
                        AND aud.CURSO_ID COLLATE DATABASE_DEFAULT = r.CURSO_ID COLLATE DATABASE_DEFAULT
                        AND aud._activo = 1
+                    LEFT JOIN dbo.BGD_MTZ_ALIAS_CARGOS al
+                        ON al.CARGO_EN_MATRIZ COLLATE Modern_Spanish_CI_AI = c.CARGO COLLATE Modern_Spanish_CI_AI
                     CROSS APPLY (
                         SELECT 
-                            CASE 
-                                WHEN c.CARGO COLLATE Modern_Spanish_CI_AI IN (
-                                    'ENFERMERO (A) JEFE', 'ENFERMERO JEFE', 'ENFERMERA JEFE', 
-                                    'ENFERMERO (A) JEFE AC', 'ENFERMERO (A) JEFE SERVICIO SOCIAL OBLIGATORIO',
-                                    'COORDINADOR (A) DE ENFERMERIA'
-                                ) THEN 'ENFERMERO (A) JEFE AC'
-                                WHEN c.CARGO COLLATE Modern_Spanish_CI_AI IN (
-                                    'MEDICO GENERAL', 'MEDICO GENERAL AC',
-                                    'MEDICO SERVICIO SOCIAL OBLIGATORIO', 'MEDICO SERVICIO OBLIGATORIO',
-                                    'COORDINADOR (A) MEDICO'
-                                ) THEN 'MEDICO GENERAL AC'
-                                ELSE c.CARGO
-                            END AS CARGO_NORMATIVO
+                            COALESCE(NULLIF(al.CARGO_EN_INDICE, ''), c.CARGO) AS CARGO_NORMATIVO,
+                            ISNULL(al.EXCLUIDO, 0) AS CARGO_EXCLUIDO
                     ) h
                     CROSS APPLY (
                         SELECT 
                             CASE 
+                                -- Si el cargo está marcado como EXCLUIDO en la tabla de alias (ej. Psicología, Nutrición)
+                                WHEN h.CARGO_EXCLUIDO = 1 THEN 0
+
+                                -- Si el cargo figura en la matriz de obligatoriedad
                                 WHEN EXISTS (
                                     SELECT 1 
                                     FROM dbo.BGD_MTZ_INDICE_OBLIGATORIEDAD ind
@@ -478,7 +473,7 @@ def load_new_architecture_dataset(
                     CROSS APPLY (
                         SELECT 
                             COALESCE(aud.FECHA_VENC_NEW, r.FECHA_VENC_ORIGEN, 
-                                     CASE WHEN COALESCE(aud.FECHA_REAL_NEW, r.FECHA_REAL_ORIGEN) IS NOT NULL 
+                                     CASE WHEN cat.VIGENCIA_MESES > 0 AND COALESCE(aud.FECHA_REAL_NEW, r.FECHA_REAL_ORIGEN) IS NOT NULL 
                                           THEN DATEADD(month, cat.VIGENCIA_MESES, COALESCE(aud.FECHA_REAL_NEW, r.FECHA_REAL_ORIGEN)) 
                                           ELSE NULL END
                             ) AS VENC_EFECTIVO,
